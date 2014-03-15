@@ -834,7 +834,7 @@ void zsetConvert(robj *zobj, int encoding) {
 }
 
 /*-----------------------------------------------------------------------------
- * Sorted set commands 
+ * Sorted set commands
  *----------------------------------------------------------------------------*/
 
 /* This generic command implements both ZADD and ZINCRBY. */
@@ -1716,9 +1716,10 @@ void zinterstoreCommand(redisClient *c) {
     zunionInterGenericCommand(c,c->argv[1], REDIS_OP_INTER);
 }
 
-void zrangeGenericCommand(redisClient *c, int reverse) {
+void zrangeGenericCommand(redisClient *c, int reverse, robj *dstkey) {
     robj *key = c->argv[1];
     robj *zobj;
+    robj *storekey = NULL;
     int withscores = 0;
     long start;
     long end;
@@ -1728,11 +1729,26 @@ void zrangeGenericCommand(redisClient *c, int reverse) {
     if ((getLongFromObjectOrReply(c, c->argv[2], &start, NULL) != REDIS_OK) ||
         (getLongFromObjectOrReply(c, c->argv[3], &end, NULL) != REDIS_OK)) return;
 
-    if (c->argc == 5 && !strcasecmp(c->argv[4]->ptr,"withscores")) {
-        withscores = 1;
-    } else if (c->argc >= 5) {
-        addReply(c,shared.syntaxerr);
-        return;
+    if (dstkey) {
+    	// Call as ZRANGESTORE command
+    	if (c->argc == 5) {
+    		storekey = dstkey;
+    	} else {
+			addReply(c,shared.syntaxerr);
+			return;
+    	}
+    } else {
+		if (c->argc == 5 && !strcasecmp(c->argv[4]->ptr,"withscores")) {
+			withscores = 1;
+		} else if (c->argc == 6 && !strcasecmp(c->argv[4]->ptr, "store")) {
+			storekey = c->argv[5];
+		} else if (c->argc == 7 && !strcasecmp(c->argv[4]->ptr, "withscores") && !strcasecmp(c->argv[5]->ptr, "store")) {
+			withscores = 1;
+			storekey = c->argv[6];
+		} else if (c->argc >= 5) {
+			addReply(c,shared.syntaxerr);
+			return;
+		}
     }
 
     if ((zobj = lookupKeyReadOrReply(c,key,shared.emptymultibulk)) == NULL
@@ -1743,6 +1759,212 @@ void zrangeGenericCommand(redisClient *c, int reverse) {
     if (start < 0) start = llen+start;
     if (end < 0) end = llen+end;
     if (start < 0) start = 0;
+
+    if (storekey) {
+        robj *dstobj;
+        zset *dstzset;
+        robj *tmp;
+        unsigned int maxelelen = 0;
+        zskiplistNode *znode;
+        int touched = 0;
+
+    	/* STORE option specified, set the sorting result as a Sorted set object */
+		if (dbDelete(c->db, storekey)) {
+			signalModifiedKey(c->db, storekey);
+			touched = 1;
+			server.dirty++;
+		}
+        dstobj = createZsetObject();
+
+        /* Invariant: start >= 0, so this test will be true when end < 0.
+         * The range is empty when start > end or start >= length. */
+        if (start > end || start >= llen) {
+			decrRefCount(dstobj);
+			addReply(c, shared.czero);
+
+            return;
+        }
+        if (end >= llen) end = llen - 1;
+        rangelen = (end - start) + 1;
+
+        dstzset = dstobj->ptr;
+
+        /* Add elements from specified range to destination set */
+        if (zobj->encoding == REDIS_ENCODING_ZIPLIST) {
+            unsigned char *zl = zobj->ptr;
+            unsigned char *eptr, *sptr;
+            unsigned char *vstr;
+            unsigned int vlen;
+            long long vlong;
+
+            /* Code dupliaction caused by performance reasons - written for speed, not readability */
+            if (reverse) {
+            	/* Storing data into new set in reversed order */
+            	unsigned char *zl2 = zobj->ptr;
+            	unsigned char *eptr2, *sptr2;
+                unsigned char *vstr2;
+                unsigned int vlen2;
+                long long vlong2;
+
+                eptr = ziplistIndex(zl, -2 - (2 * start));
+                eptr2 = ziplistIndex(zl2, 2 * start);
+
+                redisAssertWithInfo(c, zobj, eptr != NULL);
+                redisAssertWithInfo(c, zobj, eptr2 != NULL);
+                sptr = ziplistNext(zl, eptr);
+                sptr2 = ziplistNext(zl2, eptr2);
+
+                while (rangelen--) {
+                    redisAssertWithInfo(c, zobj, eptr != NULL && sptr != NULL);
+                    redisAssertWithInfo(c, zobj, ziplistGet(eptr, &vstr, &vlen, &vlong));
+                    redisAssertWithInfo(c, zobj, eptr2 != NULL && sptr2 != NULL);
+                    redisAssertWithInfo(c, zobj, ziplistGet(eptr2, &vstr2, &vlen2, &vlong2));
+
+                    if (vstr == NULL) {
+                    	tmp = createStringObjectFromLongLong(vlong);
+                        znode = zslInsert(dstzset->zsl, zzlGetScore(sptr2), tmp);
+                        incrRefCount(tmp); /* added to skiplist */
+                        dictAdd(dstzset->dict, tmp, &znode->score);
+                        incrRefCount(tmp); /* added to dictionary */
+
+                        if (tmp->encoding == REDIS_ENCODING_RAW)
+                            if (sdslen(tmp->ptr) > maxelelen)
+                                maxelelen = sdslen(tmp->ptr);
+                    } else {
+                    	tmp = createStringObject((char *)vstr, vlen);
+                        znode = zslInsert(dstzset->zsl, zzlGetScore(sptr2), tmp);
+                        incrRefCount(tmp); /* added to skiplist */
+                        dictAdd(dstzset->dict, tmp, &znode->score);
+                        incrRefCount(tmp); /* added to dictionary */
+
+                        if (tmp->encoding == REDIS_ENCODING_RAW)
+                            if (sdslen(tmp->ptr) > maxelelen)
+                                maxelelen = sdslen(tmp->ptr);
+                    }
+
+                    zzlPrev(zl, &eptr, &sptr);
+                    zzlNext(zl2, &eptr2, &sptr2);
+                }
+            } else {
+            	/* Storing data into new set in original order */
+                eptr = ziplistIndex(zl, 2 * start);
+
+                redisAssertWithInfo(c, zobj, eptr != NULL);
+                sptr = ziplistNext(zl, eptr);
+
+                while (rangelen--) {
+                    redisAssertWithInfo(c, zobj, eptr != NULL && sptr != NULL);
+                    redisAssertWithInfo(c, zobj, ziplistGet(eptr, &vstr, &vlen, &vlong));
+
+                    if (vstr == NULL) {
+                    	tmp = createStringObjectFromLongLong(vlong);
+                        znode = zslInsert(dstzset->zsl, zzlGetScore(sptr), tmp);
+                        incrRefCount(tmp); /* added to skiplist */
+                        dictAdd(dstzset->dict, tmp, &znode->score);
+                        incrRefCount(tmp); /* added to dictionary */
+
+                        if (tmp->encoding == REDIS_ENCODING_RAW)
+                            if (sdslen(tmp->ptr) > maxelelen)
+                                maxelelen = sdslen(tmp->ptr);
+                    } else {
+                    	tmp = createStringObject((char *)vstr, vlen);
+                        znode = zslInsert(dstzset->zsl, zzlGetScore(sptr), tmp);
+                        incrRefCount(tmp); /* added to skiplist */
+                        dictAdd(dstzset->dict, tmp, &znode->score);
+                        incrRefCount(tmp); /* added to dictionary */
+
+                        if (tmp->encoding == REDIS_ENCODING_RAW)
+                            if (sdslen(tmp->ptr) > maxelelen)
+                                maxelelen = sdslen(tmp->ptr);
+                    }
+
+                    zzlNext(zl, &eptr, &sptr);
+                }
+            }
+        } else if (zobj->encoding == REDIS_ENCODING_SKIPLIST) {
+            zset *zs = zobj->ptr;
+            zskiplist *zsl = zs->zsl;
+            zskiplistNode *ln;
+            robj *ele;
+
+            /* Code dupliaction caused by performance reasons - written for speed, not readability */
+            if (reverse) {
+            	/* Storing data into new set in reversed order */
+                zset *zs2 = zobj->ptr;
+                zskiplist *zsl2 = zs2->zsl;
+                zskiplistNode *ln2;
+
+            	/* Check if starting point is trivial, before doing log(N) lookup. */
+                ln = zsl->tail;
+                if (start > 0)
+                    ln = zslGetElementByRank(zsl, llen - start);
+
+                ln2 = zsl2->header->level[0].forward;
+                if (start > 0)
+                    ln2 = zslGetElementByRank(zsl2, start + 1);
+
+                while (rangelen--) {
+                    redisAssertWithInfo(c, zobj, ln != NULL);
+                    redisAssertWithInfo(c, zobj, ln2 != NULL);
+                    ele = ln->obj;
+
+                    znode = zslInsert(dstzset->zsl, ln2->score, ele);
+                    incrRefCount(ele); /* added to skiplist */
+                    dictAdd(dstzset->dict, ele, &znode->score);
+                    incrRefCount(ele); /* added to dictionary */
+
+                    if (ele->encoding == REDIS_ENCODING_RAW)
+                        if (sdslen(ele->ptr) > maxelelen)
+                            maxelelen = sdslen(ele->ptr);
+
+                    ln = ln->backward;
+                    ln2 = ln2->level[0].forward;
+                }
+            } else {
+            	/* Storing data into new set in original order */
+
+            	/* Check if starting point is trivial, before doing log(N) lookup. */
+                ln = zsl->header->level[0].forward;
+                if (start > 0)
+                    ln = zslGetElementByRank(zsl, start + 1);
+
+                while (rangelen--) {
+                    redisAssertWithInfo(c, zobj, ln != NULL);
+                    ele = ln->obj;
+
+                    znode = zslInsert(dstzset->zsl, ln->score, ele);
+                    incrRefCount(ele); /* added to skiplist */
+                    dictAdd(dstzset->dict, ele, &znode->score);
+                    incrRefCount(ele); /* added to dictionary */
+
+                    if (ele->encoding == REDIS_ENCODING_RAW)
+                        if (sdslen(ele->ptr) > maxelelen)
+                            maxelelen = sdslen(ele->ptr);
+
+                    ln = ln->level[0].forward;
+                }
+            }
+        } else {
+            redisPanic("Unknown sorted set encoding");
+        }
+
+		if (dstzset->zsl->length) {
+			/* Convert to ziplist when in limits. */
+			if (dstzset->zsl->length <= server.zset_max_ziplist_entries &&
+				maxelelen <= server.zset_max_ziplist_value)
+					zsetConvert(dstobj, REDIS_ENCODING_ZIPLIST);
+
+			dbAdd(c->db, storekey, dstobj);
+			addReplyLongLong(c, zsetLength(dstobj));
+			if (!touched) signalModifiedKey(c->db, storekey);
+			server.dirty++;
+		} else {
+			decrRefCount(dstobj);
+			addReply(c, shared.czero);
+		}
+
+		return;
+    }
 
     /* Invariant: start >= 0, so this test will be true when end < 0.
      * The range is empty when start > end or start >= length. */
@@ -1819,11 +2041,19 @@ void zrangeGenericCommand(redisClient *c, int reverse) {
 }
 
 void zrangeCommand(redisClient *c) {
-    zrangeGenericCommand(c,0);
+    zrangeGenericCommand(c,0,NULL);
 }
 
 void zrevrangeCommand(redisClient *c) {
-    zrangeGenericCommand(c,1);
+    zrangeGenericCommand(c,1,NULL);
+}
+
+void zrangestoreCommand(redisClient *c) {
+    zrangeGenericCommand(c,0,c->argv[4]);
+}
+
+void zrevrangestoreCommand(redisClient *c) {
+    zrangeGenericCommand(c,1,c->argv[4]);
 }
 
 /* This command implements ZRANGEBYSCORE, ZREVRANGEBYSCORE. */

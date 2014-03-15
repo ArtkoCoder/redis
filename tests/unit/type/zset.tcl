@@ -136,6 +136,13 @@ start_server {tags {"zset"}} {
 
             # withscores
             assert_equal {a 1 b 2 c 3 d 4} [r zrange ztmp 0 -1 withscores]
+
+            # store
+            r zrange ztmp 0 -1 store ztmp_out1
+            r zrange ztmp 0 -1 withscores store ztmp_out2
+
+            assert_equal {a b c d} [r zrange ztmp_out1 0 -1]
+            assert_equal {a 1 b 2 c 3 d 4} [r zrange ztmp_out2 0 -1 withscores]
         }
 
         test "ZREVRANGE basics - $encoding" {
@@ -166,6 +173,67 @@ start_server {tags {"zset"}} {
 
             # withscores
             assert_equal {d 4 c 3 b 2 a 1} [r zrevrange ztmp 0 -1 withscores]
+
+            # store
+            r zrevrange ztmp 0 -1 store ztmp_out1
+            r zrevrange ztmp 0 -1 withscores store ztmp_out2
+
+            assert_equal {d c b a} [r zrange ztmp_out1 0 -1]
+            assert_equal {d 1 c 2 b 3 a 4} [r zrange ztmp_out2 0 -1 withscores]
+        }
+
+        test "ZRANGESTORE basics - $encoding" {
+            r del ztmp
+            r del ztmp_out1
+            r del ztmp_out2
+            r zadd ztmp 1 a
+            r zadd ztmp 2 b
+            r zadd ztmp 3 c
+            r zadd ztmp 4 d
+
+            r zrangestore ztmp 0 -1 ztmp_out1
+            r zrangestore ztmp 0 -2 ztmp_out2
+            r zrangestore ztmp 1 -1 ztmp_out3
+            r zrangestore ztmp 1 -2 ztmp_out4
+            r zrangestore ztmp -2 -1 ztmp_out5
+            r zrangestore ztmp -2 -2 ztmp_out6
+
+            assert_equal {a b c d} [r zrange ztmp_out1 0 -1]
+            assert_equal {a 1 b 2 c 3 d 4} [r zrange ztmp_out1 0 -1 withscores]
+            assert_equal {a b c} [r zrange ztmp_out2 0 -1]
+            assert_equal {b c d} [r zrange ztmp_out3 0 -1]
+            assert_equal {b c} [r zrange ztmp_out4 0 -1]
+            assert_equal {c d} [r zrange ztmp_out5 0 -1]
+            assert_equal {c} [r zrange ztmp_out6 0 -1]
+        }
+
+        test "ZREVRANGESTORE basics - $encoding" {
+            r del ztmp
+            r del ztmp_out1
+            r del ztmp_out2
+            r del ztmp_out3
+            r del ztmp_out4
+            r del ztmp_out5
+            r del ztmp_out6
+            r zadd ztmp 1 a
+            r zadd ztmp 2 b
+            r zadd ztmp 3 c
+            r zadd ztmp 4 d
+
+            r zrevrangestore ztmp 0 -1 ztmp_out1
+            r zrevrangestore ztmp 0 -2 ztmp_out2
+            r zrevrangestore ztmp 1 -1 ztmp_out3
+            r zrevrangestore ztmp 1 -2 ztmp_out4
+            r zrevrangestore ztmp -2 -1 ztmp_out5
+            r zrevrangestore ztmp -2 -2 ztmp_out6
+
+            assert_equal {d c b a} [r zrange ztmp_out1 0 -1]
+            assert_equal {d 1 c 2 b 3 a 4} [r zrange ztmp_out1 0 -1 withscores]
+            assert_equal {d c b} [r zrange ztmp_out2 0 -1]
+            assert_equal {c b a} [r zrange ztmp_out3 0 -1]
+            assert_equal {c b} [r zrange ztmp_out4 0 -1]
+            assert_equal {b a} [r zrange ztmp_out5 0 -1]
+            assert_equal {b} [r zrange ztmp_out6 0 -1]
         }
 
         test "ZRANK/ZREVRANK basics - $encoding" {
